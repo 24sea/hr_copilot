@@ -1,36 +1,43 @@
-# db.py
+# Backend/db.py
 from os import getenv
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
+from pymongo.errors import OperationFailure
+from .config import settings  # new import but behavior preserved
 
-# Load environment variables from .env (if present)
+# Load .env as before (keeps prior behavior)
 load_dotenv()
 
-# --- MongoDB connection ---
-MONGODB_URI = getenv("MONGODB_URI", "mongodb://localhost:27017/")
+# Use settings.MONGODB_URI (falls back to same default)
+MONGODB_URI = settings.MONGODB_URI
+
 client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
 
-# Database & collections
 db = client["hr_copilot"]
 employee_collection = db["employees"]
 leave_collection = db["leaves"]
 
-# --- Indexes ---
-# Unique employee id for quick lookups
-employee_collection.create_index(
+def safe_create_index(collection, keys, **kwargs):
+    try:
+        return collection.create_index(keys, **kwargs)
+    except OperationFailure as e:
+        print(f"⚠️ Skipping index {kwargs.get('name')}: {e}")
+        return None
+
+safe_create_index(
+    employee_collection,
     [("emp_id", ASCENDING)],
     unique=True,
     name="emp_id_unique",
 )
 
-# Match the actual field stored in leave docs ("from_date"), not "from"
-leave_collection.create_index(
+safe_create_index(
+    leave_collection,
     [("emp_id", ASCENDING), ("from_date", ASCENDING)],
     name="emp_fromdate",
 )
 
-# --- One-time lightweight migration: normalize legacy leave_balance ints to dict ---
-# If any employee doc has leave_balance as a number, convert -> {"casual": <number>, "sick": 0}
+# Lightweight migration (unchanged)
 employee_collection.update_many(
     {"leave_balance": {"$type": "number"}},
     [
@@ -45,7 +52,7 @@ employee_collection.update_many(
     ],
 )
 
-# --- Seed Sample Data (idempotent) ---
+# Seed sample data (keeps original documents & logic)
 if employee_collection.count_documents({}) == 0:
     employees = [
         {
@@ -76,8 +83,6 @@ if employee_collection.count_documents({}) == 0:
     employee_collection.insert_many(employees)
     print("✅ Employees seeded successfully!")
 
-# Optional: only clear leaves if you explicitly opt in via env
-# Set CLEAR_LEAVES_ON_START=true in .env if you want a clean slate for demos
 if getenv("CLEAR_LEAVES_ON_START", "false").lower() in {"1", "true", "yes"}:
     leave_collection.delete_many({})
     print("✅ Leaves collection cleared!")
