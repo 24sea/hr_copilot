@@ -11,7 +11,10 @@ from collections import defaultdict
 from datetime import date, datetime
 
 st.set_page_config(page_title="HR Copilot", page_icon="🤖", layout="wide")
-API_URL = "http://127.0.0.1:8000"
+
+# preserve previous default but allow env override
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+
 
 # ----------------------------
 # Bundled fallback (used only if user file not found)
