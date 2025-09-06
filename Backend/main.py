@@ -159,3 +159,5 @@ def leave_history(emp_id: str):
         leave_collection.find({"emp_id": emp_id}, {"_id": 0}).sort("from_date", 1)
     )
     return {"emp_id": emp_id, "history": leaves}
+
+
