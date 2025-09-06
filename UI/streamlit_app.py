@@ -142,13 +142,27 @@ def extract_dates(text: str):
     return (None, None)
 
 def extract_emp_id(text: str):
+    """
+    Extract employee id like 10001 or E10001 while avoiding mistaking years
+    (e.g., 2025) for employee ids. Returns None if no emp id found or if the
+    matched token looks like a year in the 2020-2035 range.
+    """
     if not text:
         return None
     m = re.search(r"\b(E?\d{4,6})\b", text, re.IGNORECASE)  # accept E-prefixed ids too
     if not m:
         return None
     val = m.group(1)
-    return val[1:] if val.upper().startswith("E") and val[1:].isdigit() else val
+
+    # Normalize to core numeric portion if E-prefixed (so we can detect year-like tokens)
+    core = val[1:] if val.upper().startswith("E") and val[1:].isdigit() else val
+
+    # Exclude years (2020–2035) so they aren’t mistaken as emp_id
+    if core.isdigit() and 2020 <= int(core) <= 2035:
+        return None
+
+    # Return the normalized id (strip leading 'E' if present and numeric)
+    return core
 
 def classify_intent(text: str):
     """
