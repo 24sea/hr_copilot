@@ -12,6 +12,21 @@ from datetime import date, datetime
 
 st.set_page_config(page_title="HR Copilot", page_icon="🤖", layout="wide")
 
+# Optional webrtc import (wrapped)
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode
+    STREAMLIT_WEBRTC_AVAILABLE = True
+except Exception:
+    STREAMLIT_WEBRTC_AVAILABLE = False
+
+# Optional frame -> wav libraries for capturing frames
+try:
+    import numpy as np
+    import soundfile as sf
+    AUDIO_CONVERSION_AVAILABLE = True
+except Exception:
+    AUDIO_CONVERSION_AVAILABLE = False
+
 # preserve previous default but allow env override
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
@@ -65,7 +80,7 @@ def safe_get(url, **kwargs):
 
 def safe_post(url, **kwargs):
     try:
-        return requests.post(url, timeout=8, **kwargs)
+        return requests.post(url, timeout=30, **kwargs)
     except requests.exceptions.RequestException as e:
         st.warning(f"⚠️ Backend not reachable — {e}")
         return None
@@ -106,85 +121,55 @@ def parse_date_piece(s: str):
     return dt.date() if dt else None
 
 def extract_dates(text: str):
-    """
-    Returns (d1, d2) where each is a date or None.
-    """
     if not text:
         return (None, None)
     t = text.lower()
-
-    # ISO yyyy-mm-dd
     iso = re.findall(r"\d{4}-\d{2}-\d{2}", t)
     if len(iso) == 1:
         d = parse_date_piece(iso[0]);  return (d, d) if d else (None, None)
     if len(iso) >= 2:
         return parse_date_piece(iso[0]), parse_date_piece(iso[1])
 
-    # "from X to Y"
     m = re.search(r"from (.+?) to (.+)", t)
     if m:
         return parse_date_piece(m.group(1)), parse_date_piece(m.group(2))
 
-    # common relative keywords -> same-day range
     for kw in ["today","tomorrow","next monday","next tuesday","next wednesday",
                "next thursday","next friday","next saturday","next sunday","next week"]:
         if kw in t:
             d = parse_date_piece(kw)
             if d: return (d, d)
 
-    # fallback: search for any dates in the text
     hits = search_dates(text, settings={"PREFER_DATES_FROM": "future"}) or []
     if len(hits) == 1:
         return hits[0][1].date(), hits[0][1].date()
     if len(hits) >= 2:
         return hits[0][1].date(), hits[1][1].date()
-
     return (None, None)
 
 def extract_emp_id(text: str):
-    """
-    Extract employee id like 10001 or E10001 while avoiding mistaking years
-    (e.g., 2025) for employee ids. Returns None if no emp id found or if the
-    matched token looks like a year in the 2020-2035 range.
-    """
     if not text:
         return None
-    m = re.search(r"\b(E?\d{4,6})\b", text, re.IGNORECASE)  # accept E-prefixed ids too
+    m = re.search(r"\b(E?\d{4,6})\b", text, re.IGNORECASE)
     if not m:
         return None
     val = m.group(1)
-
-    # Normalize to core numeric portion if E-prefixed (so we can detect year-like tokens)
     core = val[1:] if val.upper().startswith("E") and val[1:].isdigit() else val
-
-    # Exclude years (2020–2035) so they aren’t mistaken as emp_id
     if core.isdigit() and 2020 <= int(core) <= 2035:
         return None
-
-    # Return the normalized id (strip leading 'E' if present and numeric)
     return core
 
 def classify_intent(text: str):
-    """
-    Stronger intent classification for apply_leave:
-    - Recognize phrases with 'leave' + verbs (take/apply/book) or 'leave' + number.
-    - Pre-process common typo 'tale' -> 'take'.
-    """
     if not text:
         return "unknown"
-    # Pre-normalize common mis-typing
     t0 = text.lower()
-    t = re.sub(r"\btale\b", "take", t0)  # catch "tale" -> "take"
-    # quick checks
+    t = re.sub(r"\btale\b", "take", t0)
     if any(k in t for k in ["leave balance","balance","remaining leaves","how many leaves"]):
         return "check_balance"
     if any(k in t for k in ["leave history","history of leaves","past leaves"]):
         return "leave_history"
-
-    # detect apply intent: verbs + 'leave' OR 'apply'/'book' present OR numeric pattern near 'leave' or 'day(s)'
     if any(k in t for k in ["apply leave","book leave","request leave", "take leave", "i want to take", "i want to apply", "i want to book"]):
         return "apply_leave"
-    # numeric patterns like "1 leave", "2 days leave", "take 3 days", "one day leave"
     if re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b.*\b(day|days|leave)\b", t):
         return "apply_leave"
     if any(k in t for k in ["apply","take","book"]) and "leave" in t:
@@ -195,24 +180,22 @@ def classify_intent(text: str):
 
 # ----------------------------
 # Holidays normalization and grouped view
+# (unchanged from your original file)
 # ----------------------------
 def _normalize_holidays_input(raw_holidays):
     if raw_holidays is None:
         return None
-    # JSON string
     if isinstance(raw_holidays, str):
         try:
             parsed = json.loads(raw_holidays)
             return _normalize_holidays_input(parsed)
         except Exception:
             return [{"date":"", "name": raw_holidays}]
-    # dict date->name
     if isinstance(raw_holidays, dict):
         out = []
         for k, v in raw_holidays.items():
             out.append({"date": str(k), "name": str(v)})
         return out
-    # list
     if isinstance(raw_holidays, list):
         out = []
         for item in raw_holidays:
@@ -405,7 +388,6 @@ with left_col:
         holidays = None
         hol_error = None
 
-        # Try user-provided path first
         candidate_paths = [file_path_input, os.path.join("UI","holidays.json"), os.path.join("/mnt/data","UI","holidays.json")]
         tried = []
         for p in candidate_paths:
@@ -423,18 +405,15 @@ with left_col:
             except Exception as e:
                 hol_error = (hol_error + " | " if hol_error else "") + f"{p} read error: {e}"
 
-        # If not loaded from file, try hardcoded mapping
         if holidays is None:
             holidays = HARDCODED_HOLIDAYS.get((country_code, int(selected_year)), None)
             if holidays is not None:
                 st.info("Using bundled hardcoded holidays.")
             else:
-                # nothing found
                 st.info(f"No local holidays file found (tried: {tried}). No hardcoded entry for {country_code}/{selected_year}.")
                 if hol_error:
                     st.info(f"Details: {hol_error}")
 
-        # Show holidays or example
         if holidays:
             show_holidays_grouped(holidays)
         else:
@@ -453,16 +432,14 @@ with right_col:
         with st.chat_message(role):
             st.markdown(content)
 
+    # ---------- typed prompt ----------
     prompt = st.chat_input("Ask Pixie about leaves...")
     if prompt:
-        # keep original for display but preprocess for parsing
         st.session_state["chat_history"].append(("user", prompt))
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # PREPROCESS to fix small typos before classifying/parsing
         prompt_clean = re.sub(r"\btale\b", "take", prompt, flags=re.IGNORECASE)
-
         intent = classify_intent(prompt_clean)
         maybe_emp = extract_emp_id(prompt_clean)
         if maybe_emp:
@@ -471,57 +448,38 @@ with right_col:
             st.session_state["emp_name"] = emp.get("name") if emp else None
             st.session_state["emp_project"] = emp.get("project") if emp else None
 
-        # ======== INTENT: CHECK BALANCE (NAVIGATE TO LEAVE BALANCE) ========
+        # Intent handlers (same as before)...
         if intent == "check_balance":
             emp_id_for_balance = maybe_emp or st.session_state.get("emp_id_input", "").strip()
-
             if not emp_id_for_balance:
                 need_id_msg = "Please share your **Employee ID** (e.g., `10001`) so I can fetch your leave balance."
                 st.session_state["chat_history"].append(("assistant", need_id_msg))
                 with st.chat_message("assistant"):
                     st.markdown(need_id_msg)
             else:
-                # Prefill the Leave Balance form and navigate there
                 st.session_state["emp_id_input"] = emp_id_for_balance
                 nav_msg = f"Opening **Leave Balance** for Employee ID **{emp_id_for_balance}** — navigating to the Leave Balance tab."
                 st.session_state["chat_history"].append(("assistant", nav_msg))
                 with st.chat_message("assistant"):
                     st.markdown(nav_msg)
-
-                # Navigate to the Leave Balance tab (deferred nav pattern)
                 request_nav("Leave Balance")
-
-        # ======== INTENT: APPLY LEAVE (PREFILL + NAV) ========
         elif intent == "apply_leave":
-            # Extract leave type (sick/casual) from prompt (fallback to session default)
             lt = normalize_leave_type(prompt_clean) or st.session_state.get("leave_type_input", "casual")
-
-            # Extract dates from prompt; if only one date, set both to same
             d1, d2 = extract_dates(prompt_clean)
-            # If user wrote "1 day" or "one day" assume same-day leave
             if (re.search(r"\b(1|one)\b\s*(day|days)?\b", prompt_clean.lower()) and d1 and not d2):
                 d2 = d1
-
-            # If no dates found, default to today (so form isn't empty)
             if not d1 and not d2:
                 d1 = d2 = date.today()
-
-            # Extract a short reason if present
             reason_guess = re.search(r"(?:because|as|for|due to|reason)\s+(.+)", prompt_clean, re.IGNORECASE)
             if reason_guess:
                 reason_text = reason_guess.group(1).strip()[:200]
             else:
                 reason_text = st.session_state.get("reason_input", "")
-
-            # If prompt contains an emp id, we already put it into session_state above
-            # Prefill session state for form
             st.session_state["leave_type_input"] = lt
             st.session_state["from_date_input"] = d1
             st.session_state["to_date_input"] = d2
             if reason_text:
                 st.session_state["reason_input"] = reason_text
-
-            # Prepare assistant message summarizing prefill
             emp_display = st.session_state.get("emp_id_input", "") or "—"
             pref_msg = (
                 "Opening **Apply Leave** with these details prefilled:\n\n"
@@ -533,15 +491,10 @@ with right_col:
             if reason_text:
                 pref_msg += f"• Reason: *{reason_text}*\n\n"
             pref_msg += "Review and click **Submit Leave Application** to apply."
-
-            # Send assistant message and navigate to Apply Leave tab
             st.session_state["chat_history"].append(("assistant", pref_msg))
             with st.chat_message("assistant"):
                 st.markdown(pref_msg)
-
             request_nav("Apply Leave")
-
-        # ======== INTENT: POLICIES (OPEN TAB OR RESPOND INLINE) ========
         elif intent == "policies":
             inline = (
                 "Here are key policies:\n"
@@ -555,7 +508,6 @@ with right_col:
             with st.chat_message("assistant"):
                 st.markdown(inline)
             request_nav("Policies")
-
         else:
             msg = (
                 "I can help with:\n"
@@ -568,6 +520,281 @@ with right_col:
             st.session_state["chat_history"].append(("assistant", msg))
             with st.chat_message("assistant"):
                 st.markdown(msg)
+
+    # ---------- microphone (webrtc) + capture & transcribe ----------
+    st.markdown("---")
+    st.markdown("**🎤 Record from your microphone (experimental)**")
+
+    if not STREAMLIT_WEBRTC_AVAILABLE:
+        st.info("Microphone widget unavailable: install a compatible 'streamlit-webrtc' package to enable microphone recording in-browser.")
+        st.caption("You can still upload an audio file below.")
+    else:
+        st.caption("Click Start in the widget below, allow microphone access, speak, then click Capture & Transcribe.")
+        rtc_configuration = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        ctx = webrtc_streamer(
+            key="mic",
+            mode=WebRtcMode.SENDONLY,
+            rtc_configuration=rtc_configuration,
+            media_stream_constraints={"audio": True, "video": False},
+        )
+
+        # "Capture & Transcribe" button: grab frames from ctx.audio_receiver, convert to WAV, POST to backend.
+        if st.button("Capture & Transcribe (webrtc)"):
+            if ctx is None:
+                st.warning("Audio context not available. Start the mic widget first.")
+            elif ctx.audio_receiver is None:
+                st.warning("Audio receiver not yet available. Try starting the widget and speaking for a few seconds.")
+            else:
+                try:
+                    frames = ctx.audio_receiver.get_frames(timeout=2)  # list of av.AudioFrame
+                except Exception as e:
+                    frames = []
+                    st.warning(f"No frames received yet: {e}")
+
+                if not frames:
+                    st.warning("No audio frames captured. Make sure the mic widget is started, you spoke for a moment, then click this button.")
+                else:
+                    if not AUDIO_CONVERSION_AVAILABLE:
+                        st.error("Server missing numpy/soundfile. Install 'numpy' and 'soundfile' in the Streamlit environment to convert frames.")
+                    else:
+                        try:
+                            # Convert frames (list of av.AudioFrame) -> numpy array -> write WAV bytes
+                            arrays = [f.to_ndarray() for f in frames]  # each: shape (channels, samples)
+                            # concatenate along time axis
+                            data = np.concatenate(arrays, axis=1)  # shape (channels, total_samples)
+                            sample_rate = frames[0].sample_rate
+                            # write to bytes buffer (WAV)
+                            import io
+                            wav_buf = io.BytesIO()
+                            # soundfile expects shape (samples, channels)
+                            sf.write(wav_buf, data.T, sample_rate, format="WAV", subtype="PCM_16")
+                            wav_buf.seek(0)
+
+                            # POST to backend transcribe endpoint (same as file upload flow)
+                            files = {"file": ("mic_capture.wav", wav_buf, "audio/wav")}
+                            res = safe_post(f"{API_URL}/transcribe", files=files)
+                            if not res:
+                                st.error("Transcription failed: backend not reachable.")
+                            elif res.status_code != 200:
+                                try:
+                                    st.error(f"Transcription error: {res.json().get('detail', res.text)}")
+                                except Exception:
+                                    st.error(f"Transcription error: {res.text}")
+                            else:
+                                transcribed = res.json().get("text", "")
+                                if not transcribed:
+                                    st.warning("No speech recognized in the capture. Try again with clearer audio.")
+                                else:
+                                    st.success("Transcription complete:")
+                                    st.markdown(f"> {transcribed}")
+
+                                    # append to chat history and process same as typed prompt
+                                    st.session_state["chat_history"].append(("user", transcribed))
+                                    with st.chat_message("user"):
+                                        st.markdown(transcribed)
+
+                                    # reuse the same processing logic as typed prompt
+                                    prompt_clean = re.sub(r"\btale\b", "take", transcribed, flags=re.IGNORECASE)
+                                    intent = classify_intent(prompt_clean)
+                                    maybe_emp = extract_emp_id(prompt_clean)
+                                    if maybe_emp:
+                                        st.session_state["emp_id_input"] = maybe_emp
+                                        emp = lookup_employee(maybe_emp)
+                                        st.session_state["emp_name"] = emp.get("name") if emp else None
+                                        st.session_state["emp_project"] = emp.get("project") if emp else None
+
+                                    # handle intents (same as above: navigate/prefill)
+                                    if intent == "check_balance":
+                                        emp_id_for_balance = maybe_emp or st.session_state.get("emp_id_input", "").strip()
+                                        if not emp_id_for_balance:
+                                            need_id_msg = "Please share your **Employee ID** (e.g., `10001`) so I can fetch your leave balance."
+                                            st.session_state["chat_history"].append(("assistant", need_id_msg))
+                                            with st.chat_message("assistant"):
+                                                st.markdown(need_id_msg)
+                                        else:
+                                            st.session_state["emp_id_input"] = emp_id_for_balance
+                                            nav_msg = f"Opening **Leave Balance** for Employee ID **{emp_id_for_balance}** — navigating to the Leave Balance tab."
+                                            st.session_state["chat_history"].append(("assistant", nav_msg))
+                                            with st.chat_message("assistant"):
+                                                st.markdown(nav_msg)
+                                            request_nav("Leave Balance")
+                                    elif intent == "apply_leave":
+                                        lt = normalize_leave_type(prompt_clean) or st.session_state.get("leave_type_input", "casual")
+                                        d1, d2 = extract_dates(prompt_clean)
+                                        if (re.search(r"\b(1|one)\b\s*(day|days)?\b", prompt_clean.lower()) and d1 and not d2):
+                                            d2 = d1
+                                        if not d1 and not d2:
+                                            d1 = d2 = date.today()
+                                        reason_guess = re.search(r"(?:because|as|for|due to|reason)\s+(.+)", prompt_clean, re.IGNORECASE)
+                                        if reason_guess:
+                                            reason_text = reason_guess.group(1).strip()[:200]
+                                        else:
+                                            reason_text = st.session_state.get("reason_input", "")
+                                        st.session_state["leave_type_input"] = lt
+                                        st.session_state["from_date_input"] = d1
+                                        st.session_state["to_date_input"] = d2
+                                        if reason_text:
+                                            st.session_state["reason_input"] = reason_text
+                                        emp_display = st.session_state.get("emp_id_input", "") or "—"
+                                        pref_msg = (
+                                            "Opening **Apply Leave** with these details prefilled:\n\n"
+                                            f"• Employee ID: **{emp_display}**\n"
+                                            f"• Leave type: **{lt}**\n"
+                                            f"• From: **{st.session_state['from_date_input']}**\n"
+                                            f"• To: **{st.session_state['to_date_input']}**\n"
+                                        )
+                                        if reason_text:
+                                            pref_msg += f"• Reason: *{reason_text}*\n\n"
+                                        pref_msg += "Review and click **Submit Leave Application** to apply."
+                                        st.session_state["chat_history"].append(("assistant", pref_msg))
+                                        with st.chat_message("assistant"):
+                                            st.markdown(pref_msg)
+                                        request_nav("Apply Leave")
+                                    elif intent == "policies":
+                                        inline = (
+                                            "Here are key policies:\n"
+                                            "- **Annual Leave:** 12 days/year\n"
+                                            "- **Sick Leave:** 8 days/year\n"
+                                            "- **Carry Forward:** up to 5 days/year\n"
+                                            "- **Maternity:** typically 26 weeks (see company handbook)\n\n"
+                                            "Opening **Policies** tab for details."
+                                        )
+                                        st.session_state["chat_history"].append(("assistant", inline))
+                                        with st.chat_message("assistant"):
+                                            st.markdown(inline)
+                                        request_nav("Policies")
+                                    else:
+                                        msg = (
+                                            "I can help with:\n"
+                                            "• **Leave Balance** — *'I want to know my leave balance 10001'*.\n"
+                                            "• **Apply Leave** — *'I want to take 1 PL tomorrow'*.\n"
+                                            "• **Leave History** — *'Show my leave history for 10001'*.\n"
+                                            "• **Policies** — *'maternity policy please'*.\n"
+                                            "Tip: include your **Employee ID**."
+                                        )
+                                        st.session_state["chat_history"].append(("assistant", msg))
+                                        with st.chat_message("assistant"):
+                                            st.markdown(msg)
+
+                        except Exception as e:
+                            st.error(f"Failed to convert/send captured audio: {e}")
+
+    # ---------- audio upload & transcribe (fallback) ----------
+    st.markdown("---")
+    st.markdown("**🎙 Or upload an audio message (wav/mp3/ogg/m4a)**")
+    audio_file = st.file_uploader("Upload voice (optional) and click 'Transcribe & Send'", type=["wav", "mp3", "ogg", "m4a"])
+
+    if audio_file:
+        col_t1, col_t2 = st.columns([1, 3])
+        with col_t1:
+            if st.button("Transcribe & Send"):
+                with st.spinner("Transcribing audio..."):
+                    try:
+                        audio_bytes = audio_file.read()
+                        files = {"file": (audio_file.name, audio_bytes, audio_file.type or "audio/mpeg")}
+                        res = safe_post(f"{API_URL}/transcribe", files=files)
+                        if not res:
+                            st.error("Transcription failed: backend not reachable.")
+                        elif res.status_code != 200:
+                            try:
+                                st.error(f"Transcription error: {res.json().get('detail', res.text)}")
+                            except Exception:
+                                st.error(f"Transcription error: {res.text}")
+                        else:
+                            transcribed = res.json().get("text", "")
+                            if not transcribed:
+                                st.warning("No speech recognized. Try clearer audio or a different file.")
+                            else:
+                                st.success("Transcription complete:")
+                                st.markdown(f"> {transcribed}")
+                                st.session_state["chat_history"].append(("user", transcribed))
+                                with st.chat_message("user"):
+                                    st.markdown(transcribed)
+
+                                # reuse the same processing logic as for typed prompt
+                                prompt_clean = re.sub(r"\btale\b", "take", transcribed, flags=re.IGNORECASE)
+                                intent = classify_intent(prompt_clean)
+                                maybe_emp = extract_emp_id(prompt_clean)
+                                if maybe_emp:
+                                    st.session_state["emp_id_input"] = maybe_emp
+                                    emp = lookup_employee(maybe_emp)
+                                    st.session_state["emp_name"] = emp.get("name") if emp else None
+                                    st.session_state["emp_project"] = emp.get("project") if emp else None
+
+                                # handle intents (same as typed)
+                                if intent == "check_balance":
+                                    emp_id_for_balance = maybe_emp or st.session_state.get("emp_id_input", "").strip()
+                                    if not emp_id_for_balance:
+                                        need_id_msg = "Please share your **Employee ID** (e.g., `10001`) so I can fetch your leave balance."
+                                        st.session_state["chat_history"].append(("assistant", need_id_msg))
+                                        with st.chat_message("assistant"):
+                                            st.markdown(need_id_msg)
+                                    else:
+                                        st.session_state["emp_id_input"] = emp_id_for_balance
+                                        nav_msg = f"Opening **Leave Balance** for Employee ID **{emp_id_for_balance}** — navigating to the Leave Balance tab."
+                                        st.session_state["chat_history"].append(("assistant", nav_msg))
+                                        with st.chat_message("assistant"):
+                                            st.markdown(nav_msg)
+                                        request_nav("Leave Balance")
+                                elif intent == "apply_leave":
+                                    lt = normalize_leave_type(prompt_clean) or st.session_state.get("leave_type_input", "casual")
+                                    d1, d2 = extract_dates(prompt_clean)
+                                    if (re.search(r"\b(1|one)\b\s*(day|days)?\b", prompt_clean.lower()) and d1 and not d2):
+                                        d2 = d1
+                                    if not d1 and not d2:
+                                        d1 = d2 = date.today()
+                                    reason_guess = re.search(r"(?:because|as|for|due to|reason)\s+(.+)", prompt_clean, re.IGNORECASE)
+                                    if reason_guess:
+                                        reason_text = reason_guess.group(1).strip()[:200]
+                                    else:
+                                        reason_text = st.session_state.get("reason_input", "")
+                                    st.session_state["leave_type_input"] = lt
+                                    st.session_state["from_date_input"] = d1
+                                    st.session_state["to_date_input"] = d2
+                                    if reason_text:
+                                        st.session_state["reason_input"] = reason_text
+                                    emp_display = st.session_state.get("emp_id_input", "") or "—"
+                                    pref_msg = (
+                                        "Opening **Apply Leave** with these details prefilled:\n\n"
+                                        f"• Employee ID: **{emp_display}**\n"
+                                        f"• Leave type: **{lt}**\n"
+                                        f"• From: **{st.session_state['from_date_input']}**\n"
+                                        f"• To: **{st.session_state['to_date_input']}**\n"
+                                    )
+                                    if reason_text:
+                                        pref_msg += f"• Reason: *{reason_text}*\n\n"
+                                    pref_msg += "Review and click **Submit Leave Application** to apply."
+                                    st.session_state["chat_history"].append(("assistant", pref_msg))
+                                    with st.chat_message("assistant"):
+                                        st.markdown(pref_msg)
+                                    request_nav("Apply Leave")
+                                elif intent == "policies":
+                                    inline = (
+                                        "Here are key policies:\n"
+                                        "- **Annual Leave:** 12 days/year\n"
+                                        "- **Sick Leave:** 8 days/year\n"
+                                        "- **Carry Forward:** up to 5 days/year\n"
+                                        "- **Maternity:** typically 26 weeks (see company handbook)\n\n"
+                                        "Opening **Policies** tab for details."
+                                    )
+                                    st.session_state["chat_history"].append(("assistant", inline))
+                                    with st.chat_message("assistant"):
+                                        st.markdown(inline)
+                                    request_nav("Policies")
+                                else:
+                                    msg = (
+                                        "I can help with:\n"
+                                        "• **Leave Balance** — *'I want to know my leave balance 10001'*.\n"
+                                        "• **Apply Leave** — *'I want to take 1 PL tomorrow'*.\n"
+                                        "• **Leave History** — *'Show my leave history for 10001'*.\n"
+                                        "• **Policies** — *'maternity policy please'*.\n"
+                                        "Tip: include your **Employee ID**."
+                                    )
+                                    st.session_state["chat_history"].append(("assistant", msg))
+                                    with st.chat_message("assistant"):
+                                        st.markdown(msg)
+                    except Exception as e:
+                        st.error(f"Transcription failed: {e}")
 
 # small CSS
 st.markdown("""<style>.stMetric { border-radius: 12px; padding: 8px; }.block-container { padding-top: 1.2rem; }</style>""", unsafe_allow_html=True)
