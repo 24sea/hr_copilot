@@ -530,23 +530,29 @@ with right_col:
         st.caption("You can still upload an audio file below.")
     else:
         st.caption("Click Start in the widget below, allow microphone access, speak, then click Capture & Transcribe.")
+
+        # Increase audio_receiver_size to avoid queue overflow messages.
+        # Default small queue can overflow for longer capture — bump to a higher value.
         rtc_configuration = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
         ctx = webrtc_streamer(
             key="mic",
             mode=WebRtcMode.SENDONLY,
             rtc_configuration=rtc_configuration,
             media_stream_constraints={"audio": True, "video": False},
+            # Increase receiver buffer to avoid overflow logs; tune if necessary.
+            audio_receiver_size=256,
         )
 
         # "Capture & Transcribe" button: grab frames from ctx.audio_receiver, convert to WAV, POST to backend.
         if st.button("Capture & Transcribe (webrtc)"):
             if ctx is None:
                 st.warning("Audio context not available. Start the mic widget first.")
-            elif ctx.audio_receiver is None:
+            elif getattr(ctx, "audio_receiver", None) is None:
                 st.warning("Audio receiver not yet available. Try starting the widget and speaking for a few seconds.")
             else:
                 try:
-                    frames = ctx.audio_receiver.get_frames(timeout=2)  # list of av.AudioFrame
+                    # Grab frames (non-blocking timeout short)
+                    frames = ctx.audio_receiver.get_frames(timeout=2)
                 except Exception as e:
                     frames = []
                     st.warning(f"No frames received yet: {e}")
@@ -555,22 +561,43 @@ with right_col:
                     st.warning("No audio frames captured. Make sure the mic widget is started, you spoke for a moment, then click this button.")
                 else:
                     if not AUDIO_CONVERSION_AVAILABLE:
-                        st.error("Server missing numpy/soundfile. Install 'numpy' and 'soundfile' in the Streamlit environment to convert frames.")
+                        st.error("Missing conversion libs in Streamlit env: install 'numpy' and 'soundfile' to convert frames.")
                     else:
                         try:
-                            # Convert frames (list of av.AudioFrame) -> numpy array -> write WAV bytes
-                            arrays = [f.to_ndarray() for f in frames]  # each: shape (channels, samples)
-                            # concatenate along time axis
+                            # Convert frames -> numpy arrays robustly
+                            arrays = []
+                            sample_rate = None
+                            for f in frames:
+                                # f is av.AudioFrame-like; to_ndarray returns shape (channels, samples)
+                                arr = f.to_ndarray()
+                                if arr.ndim == 1:
+                                    # mono (samples,)
+                                    arr = np.expand_dims(arr, axis=0)
+                                # ensure shape (channels, samples)
+                                arrays.append(arr)
+                                if sample_rate is None:
+                                    sample_rate = getattr(f, "sample_rate", None) or getattr(f, "rate", None)
+
+                            # concatenate along time axis (axis=1)
                             data = np.concatenate(arrays, axis=1)  # shape (channels, total_samples)
-                            sample_rate = frames[0].sample_rate
-                            # write to bytes buffer (WAV)
+                            if data.ndim == 1:
+                                data = np.expand_dims(data, 0)
+
+                            # Prepare WAV bytes (soundfile expects shape (samples, channels))
                             import io
                             wav_buf = io.BytesIO()
-                            # soundfile expects shape (samples, channels)
-                            sf.write(wav_buf, data.T, sample_rate, format="WAV", subtype="PCM_16")
+                            sf.write(wav_buf, data.T, int(sample_rate or 48000), format="WAV", subtype="PCM_16")
                             wav_buf.seek(0)
 
-                            # POST to backend transcribe endpoint (same as file upload flow)
+                            # Drain/clear receiver to avoid queue buildup
+                            try:
+                                # streamlit-webrtc does not guarantee clear() method — do best-effort
+                                if hasattr(ctx.audio_receiver, "clear"):
+                                    ctx.audio_receiver.clear()
+                            except Exception:
+                                pass
+
+                            # POST to backend transcribe endpoint
                             files = {"file": ("mic_capture.wav", wav_buf, "audio/wav")}
                             res = safe_post(f"{API_URL}/transcribe", files=files)
                             if not res:
@@ -593,7 +620,7 @@ with right_col:
                                     with st.chat_message("user"):
                                         st.markdown(transcribed)
 
-                                    # reuse the same processing logic as typed prompt
+                                    # reuse same processing as typed prompt
                                     prompt_clean = re.sub(r"\btale\b", "take", transcribed, flags=re.IGNORECASE)
                                     intent = classify_intent(prompt_clean)
                                     maybe_emp = extract_emp_id(prompt_clean)
@@ -603,7 +630,7 @@ with right_col:
                                         st.session_state["emp_name"] = emp.get("name") if emp else None
                                         st.session_state["emp_project"] = emp.get("project") if emp else None
 
-                                    # handle intents (same as above: navigate/prefill)
+                                    # handle intents (same as other flows)
                                     if intent == "check_balance":
                                         emp_id_for_balance = maybe_emp or st.session_state.get("emp_id_input", "").strip()
                                         if not emp_id_for_balance:
