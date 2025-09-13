@@ -9,7 +9,6 @@ import os
 import asyncio
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 
 # package-qualified imports so uvicorn Backend.main:app works
@@ -30,19 +29,8 @@ except Exception:
 # init logging
 setup_logging()
 logger = logging.getLogger("hr_copilot")
-logger.info(f"AUDIO_LIBS_AVAILABLE={AUDIO_LIBS_AVAILABLE}")
 
 app = FastAPI(title="HR Copilot Backend")
-
-# Allow cross-origin requests from your frontend (Streamlit) during development
-# In production restrict origins as needed.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # change to your frontend origin(s) for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # -----------------------------
 # Helpers
