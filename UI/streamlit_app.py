@@ -8,7 +8,7 @@ import dateparser
 from dateparser.search import search_dates
 import pandas as pd
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 st.set_page_config(page_title="HR Copilot", page_icon="🤖", layout="wide")
 
@@ -51,6 +51,7 @@ def _init_state():
     st.session_state.setdefault("reason_input", "")
     # preserve parsed prefill from Pixie when emp_id was missing
     st.session_state.setdefault("prefill_from_chat", None)  # dict or None
+
 
 _init_state()
 if st.session_state.get("pending_nav"):
@@ -122,11 +123,62 @@ def parse_date_piece(s: str):
     return dt.date() if dt else None
 
 
+# helper to clean date-like substrings from reason text
+_MONTH_NAMES = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+_date_phrase_re = re.compile(
+    rf"(\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH_NAMES}(?:\s+\d{{4}})?\b|\b{_MONTH_NAMES}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s+\d{{4}})?\b|\b\d{{4}}-\d{{2}}-\d{{2}}\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_date_phrases(text: str) -> str:
+    if not text:
+        return text
+    # remove ISO dates and "15 September" style tokens
+    cleaned = _date_phrase_re.sub("", text)
+    # also remove stray 'on' or leading 'for' if left at start
+    cleaned = re.sub(r"^\s*(on|for)\b[:\s,-]*", "", cleaned, flags=re.IGNORECASE)
+    # normalize spaces
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+# words -> ints for small numbers
+_WORD_NUM = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def _word_to_int(tok: str) -> int | None:
+    tok = tok.lower().strip()
+    if tok.isdigit():
+        try:
+            return int(tok)
+        except Exception:
+            return None
+    return _WORD_NUM.get(tok)
+
+
 def extract_dates(text: str):
     """
     Returns (d1, d2) where each is a date or None.
-    Improved to accept YYYY-MM-DD and YYYY/MM/DD and to ensure that
+    Accepts YYYY-MM-DD / YYYY/MM/DD and ensures that
     a single parsed date is treated as both from & to (one-day leave).
+
+    Improvements:
+    - Prefer tokens that contain a month name when multiple hits are returned.
+    - If user didn't specify year, force the year to current year for ambiguous tokens.
+    - If user mentions "X day(s)" and a month token exists, use that count to build the range.
+    - Always return (from_date, to_date) with from_date <= to_date.
     """
     if not text:
         return (None, None)
@@ -140,12 +192,18 @@ def extract_dates(text: str):
     if len(iso) >= 2:
         d1 = parse_date_piece(iso[0])
         d2 = parse_date_piece(iso[1])
+        if d1 and d2:
+            return (min(d1, d2), max(d1, d2))
         return (d1, d2)
 
     # "from X to Y"
     m = re.search(r"from (.+?) to (.+)", t)
     if m:
-        return parse_date_piece(m.group(1)), parse_date_piece(m.group(2))
+        p1 = parse_date_piece(m.group(1))
+        p2 = parse_date_piece(m.group(2))
+        if p1 and p2:
+            return (min(p1, p2), max(p1, p2))
+        return (p1, p2)
 
     # common relative keywords -> same-day range
     for kw in [
@@ -165,13 +223,71 @@ def extract_dates(text: str):
             if d:
                 return (d, d)
 
-    # fallback: search for any dates in the text using dateparser's flexible search
-    hits = search_dates(text, settings={"PREFER_DATES_FROM": "future"}) or []
-    if len(hits) == 1:
-        d = hits[0][1].date()
-        return (d, d)
-    if len(hits) >= 2:
-        return (hits[0][1].date(), hits[1][1].date())
+    # fallback: use dateparser's flexible search
+    hits = search_dates(text) or []  # list of (token, datetime)
+    today = date.today()
+
+    def _adjust_year_if_no_year_in_token(token: str, parsed_dt: date) -> date:
+        # If token contains explicit 4-digit year, respect it.
+        if re.search(r"\b\d{4}\b", token):
+            return parsed_dt
+        # Force to current year if parsed year differs
+        if parsed_dt.year != today.year:
+            try:
+                return parsed_dt.replace(year=today.year)
+            except Exception:
+                return parsed_dt
+        return parsed_dt
+
+    # Prefer hits which contain month names
+    month_hits = [(tok, dt) for tok, dt in hits if re.search(_MONTH_NAMES, tok, flags=re.IGNORECASE)]
+    other_hits = [(tok, dt) for tok, dt in hits if not re.search(_MONTH_NAMES, tok, flags=re.IGNORECASE)]
+
+    # If we have a month hit, treat that as the primary date
+    if month_hits:
+        # pick first month hit (search_dates returns in text order)
+        primary_token, primary_dt_raw = month_hits[0]
+        primary_dt = primary_dt_raw.date()
+        primary_dt = _adjust_year_if_no_year_in_token(primary_token, primary_dt)
+
+        # check if user specified a day count ("1 day", "3 days", "one day", etc.)
+        mcount = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b\s*(?:day|days)\b", t, flags=re.IGNORECASE)
+        if mcount:
+            n_tok = mcount.group(1).lower()
+            n = _word_to_int(n_tok) or (int(n_tok) if n_tok.isdigit() else None)
+            if n is None:
+                # fallback to same-day if cannot parse number
+                return (primary_dt, primary_dt)
+            if n <= 1:
+                return (primary_dt, primary_dt)
+            # n>1 -> range of n days starting primary_dt
+            return (primary_dt, primary_dt + timedelta(days=n - 1))
+
+        # If there are other month hits, use the first two chronological month hits
+        if len(month_hits) >= 2:
+            parsed = []
+            for tok, dt in month_hits[:2]:
+                d = dt.date()
+                d = _adjust_year_if_no_year_in_token(tok, d)
+                parsed.append(d)
+            parsed_sorted = sorted(parsed)
+            return (parsed_sorted[0], parsed_sorted[-1])
+
+        # No day-count and only one month hit -> treat as single-day leave
+        return (primary_dt, primary_dt)
+
+    # No month hits: fall back to generic behavior
+    parsed_dates = []
+    for tok, dt in hits:
+        d = dt.date()
+        d = _adjust_year_if_no_year_in_token(tok, d)
+        parsed_dates.append(d)
+
+    if len(parsed_dates) == 1:
+        return (parsed_dates[0], parsed_dates[0])
+    if len(parsed_dates) >= 2:
+        parsed_dates_sorted = sorted(parsed_dates)
+        return (parsed_dates_sorted[0], parsed_dates_sorted[-1])
 
     return (None, None)
 
@@ -396,7 +512,7 @@ with left_col:
             # Policies can be viewed even without emp, show as normal
             st.subheader("📘 Company Policies")
             st.markdown(
-                """- **Annual Leave:** 12 days/year  \n- **Sick Leave:** 8 days/year  \n- **Carry Forward:** Up to 5 days"""
+                "- **Annual Leave:** 12 days/year  \n- **Sick Leave:** 8 days/year  \n- **Carry Forward:** Up to 5 days"
             )
             year = date.today().year
             col1, col2, col3 = st.columns([1, 1, 1])
@@ -504,7 +620,7 @@ with left_col:
         # Policies: load local holidays.json (no upload) if present, else fallback to hardcoded
         if menu == "Policies":
             st.subheader("📘 Company Policies")
-            st.markdown("""- **Annual Leave:** 12 days/year  \n- **Sick Leave:** 8 days/year  \n- **Carry Forward:** Up to 5 days""")
+            st.markdown("- **Annual Leave:** 12 days/year  \n- **Sick Leave:** 8 days/year  \n- **Carry Forward:** Up to 5 days")
             year = date.today().year
             col1, col2, col3 = st.columns([1, 1, 1])
             with col1:
@@ -623,7 +739,9 @@ with right_col:
 
             # Extract dates from prompt; if only one date, set both to same
             d1, d2 = extract_dates(prompt_clean)
-            # If user wrote "1 day" or "one day" assume same-day leave
+
+            # If user wrote "1 day" or "one day" assume same-day leave (explicit number phrases)
+            # (this is now handled inside extract_dates when a month token exists)
             if (re.search(r"\b(1|one)\b\s*(day|days)?\b", prompt_clean.lower()) and d1 and not d2):
                 d2 = d1
 
@@ -632,11 +750,14 @@ with right_col:
                 d1 = d2 = date.today()
 
             # Extract a short reason if present
+            # Capture 'because|as|for|due to|reason' followed by text
             reason_guess = re.search(r"(?:because|as|for|due to|reason)\s+(.+)", prompt_clean, re.IGNORECASE)
             if reason_guess:
                 reason_text = reason_guess.group(1).strip()[:200]
+                # Remove any date-like phrases from the reason (so "for 15 september because of travel" -> "because of travel")
+                reason_text = _strip_date_phrases(reason_text)
             else:
-                # If the message looks like it's just a date token, don't shove that into reason.
+                # If the message looks like it's just a ISO date token, don't shove that into reason.
                 date_tokens = re.findall(r"\d{4}[/-]\d{2}[/-]\d{2}", prompt_clean)
                 if date_tokens and re.sub(r"[\d\-/\s]", "", prompt_clean).strip() == "":
                     reason_text = ""

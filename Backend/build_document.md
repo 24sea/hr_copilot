@@ -1,4 +1,4 @@
-# HR Copilot — Build Document (Hackathon Submission)
+# HR Copilot — Build Document
 
 ## 1. Problem
 HR tasks like leave management, employee lookup, and policy search are spread across multiple systems and require manual effort. This creates delays, reduces efficiency, and makes it hard for employees to quickly access HR services.
@@ -37,13 +37,12 @@ This improves speed, reduces manual errors, and creates a conversational HR expe
 
 ## 5. How to Run Locally
 1. Clone the repository:
-   ```bash
-   git clone https://github.com/<your-username>/hr_copilot.git
+   bash:
+   git clone https://github.com/24sea/hr_copilot.git
    cd hr_copilot
-Create and activate a virtual environment:
 
-bash
-Copy code
+# Create and activate a virtual environment:
+bash:
 python -m venv .venv
 # Linux/macOS
 source .venv/bin/activate
