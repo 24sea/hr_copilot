@@ -12,12 +12,12 @@ from datetime import date, datetime, timedelta
 
 st.set_page_config(page_title="HR Copilot", page_icon="🤖", layout="wide")
 
-# preserve previous default but allow env override
+# backend base url (can override via env)
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
 
 # ----------------------------
-# Bundled fallback (used only if user file not found)
+# Fallback holidays (used if no file)
 # ----------------------------
 HARDCODED_HOLIDAYS = {
     ("IN", 2025): [
@@ -42,14 +42,13 @@ def _init_state():
     st.session_state.setdefault("pending_nav", None)
     st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("pixie_greeted", False)
-    st.session_state.setdefault("emp_id_input", "")       # normalized numeric id (string)
+    st.session_state.setdefault("emp_id_input", "")       # numeric id as string
     st.session_state.setdefault("emp_name", None)
     st.session_state.setdefault("emp_project", None)
     st.session_state.setdefault("leave_type_input", "casual")
     st.session_state.setdefault("from_date_input", date.today())
     st.session_state.setdefault("to_date_input", date.today())
     st.session_state.setdefault("reason_input", "")
-    # preserve parsed prefill from Pixie when emp_id was missing
     st.session_state.setdefault("prefill_from_chat", None)  # dict or None
 
 
@@ -59,7 +58,7 @@ if st.session_state.get("pending_nav"):
 
 
 # ----------------------------
-# Utilities
+# HTTP helpers
 # ----------------------------
 def safe_get(url, **kwargs):
     try:
@@ -94,7 +93,7 @@ def lookup_employee(emp_id: str):
 
 
 # ----------------------------
-# Simple NLP/date helpers (as before)
+# NLP / date helpers
 # ----------------------------
 LEAVE_ALIASES = {
     "pl": "casual",
@@ -123,7 +122,7 @@ def parse_date_piece(s: str):
     return dt.date() if dt else None
 
 
-# helper to clean date-like substrings from reason text
+# remove date-like phrases from reason text
 _MONTH_NAMES = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
 _date_phrase_re = re.compile(
     rf"(\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH_NAMES}(?:\s+\d{{4}})?\b|\b{_MONTH_NAMES}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s+\d{{4}})?\b|\b\d{{4}}-\d{{2}}-\d{{2}}\b)",
@@ -134,16 +133,13 @@ _date_phrase_re = re.compile(
 def _strip_date_phrases(text: str) -> str:
     if not text:
         return text
-    # remove ISO dates and "15 September" style tokens
     cleaned = _date_phrase_re.sub("", text)
-    # also remove stray 'on' or leading 'for' if left at start
     cleaned = re.sub(r"^\s*(on|for)\b[:\s,-]*", "", cleaned, flags=re.IGNORECASE)
-    # normalize spaces
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned
 
 
-# words -> ints for small numbers
+# small words -> ints
 _WORD_NUM = {
     "one": 1,
     "two": 2,
@@ -170,21 +166,14 @@ def _word_to_int(tok: str) -> int | None:
 
 def extract_dates(text: str):
     """
-    Returns (d1, d2) where each is a date or None.
-    Accepts YYYY-MM-DD / YYYY/MM/DD and ensures that
-    a single parsed date is treated as both from & to (one-day leave).
-
-    Improvements:
-    - Prefer tokens that contain a month name when multiple hits are returned.
-    - If user didn't specify year, force the year to current year for ambiguous tokens.
-    - If user mentions "X day(s)" and a month token exists, use that count to build the range.
-    - Always return (from_date, to_date) with from_date <= to_date.
+    Returns (from_date, to_date) or (None, None).
+    Handles ISO dates, relative keywords, month-name preference, and day-counts.
     """
     if not text:
         return (None, None)
     t = text.lower()
 
-    # Accept both yyyy-mm-dd and yyyy/mm/dd
+    # ISO dates
     iso = re.findall(r"\d{4}[/-]\d{2}[/-]\d{2}", t)
     if len(iso) == 1:
         d = parse_date_piece(iso[0])
@@ -205,7 +194,7 @@ def extract_dates(text: str):
             return (min(p1, p2), max(p1, p2))
         return (p1, p2)
 
-    # common relative keywords -> same-day range
+    # quick relative keywords -> same-day
     for kw in [
         "today",
         "tomorrow",
@@ -223,15 +212,13 @@ def extract_dates(text: str):
             if d:
                 return (d, d)
 
-    # fallback: use dateparser's flexible search
-    hits = search_dates(text) or []  # list of (token, datetime)
+    # fallback to dateparser search
+    hits = search_dates(text) or []
     today = date.today()
 
     def _adjust_year_if_no_year_in_token(token: str, parsed_dt: date) -> date:
-        # If token contains explicit 4-digit year, respect it.
         if re.search(r"\b\d{4}\b", token):
             return parsed_dt
-        # Force to current year if parsed year differs
         if parsed_dt.year != today.year:
             try:
                 return parsed_dt.replace(year=today.year)
@@ -239,31 +226,26 @@ def extract_dates(text: str):
                 return parsed_dt
         return parsed_dt
 
-    # Prefer hits which contain month names
+    # prefer tokens containing month names
     month_hits = [(tok, dt) for tok, dt in hits if re.search(_MONTH_NAMES, tok, flags=re.IGNORECASE)]
     other_hits = [(tok, dt) for tok, dt in hits if not re.search(_MONTH_NAMES, tok, flags=re.IGNORECASE)]
 
-    # If we have a month hit, treat that as the primary date
     if month_hits:
-        # pick first month hit (search_dates returns in text order)
         primary_token, primary_dt_raw = month_hits[0]
         primary_dt = primary_dt_raw.date()
         primary_dt = _adjust_year_if_no_year_in_token(primary_token, primary_dt)
 
-        # check if user specified a day count ("1 day", "3 days", "one day", etc.)
+        # check for "n days"
         mcount = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b\s*(?:day|days)\b", t, flags=re.IGNORECASE)
         if mcount:
             n_tok = mcount.group(1).lower()
             n = _word_to_int(n_tok) or (int(n_tok) if n_tok.isdigit() else None)
             if n is None:
-                # fallback to same-day if cannot parse number
                 return (primary_dt, primary_dt)
             if n <= 1:
                 return (primary_dt, primary_dt)
-            # n>1 -> range of n days starting primary_dt
             return (primary_dt, primary_dt + timedelta(days=n - 1))
 
-        # If there are other month hits, use the first two chronological month hits
         if len(month_hits) >= 2:
             parsed = []
             for tok, dt in month_hits[:2]:
@@ -273,10 +255,8 @@ def extract_dates(text: str):
             parsed_sorted = sorted(parsed)
             return (parsed_sorted[0], parsed_sorted[-1])
 
-        # No day-count and only one month hit -> treat as single-day leave
         return (primary_dt, primary_dt)
 
-    # No month hits: fall back to generic behavior
     parsed_dates = []
     for tok, dt in hits:
         d = dt.date()
@@ -294,46 +274,33 @@ def extract_dates(text: str):
 
 def extract_emp_id(text: str):
     """
-    Extract employee id like 10001 or E10001 while avoiding mistaking years
-    (e.g., 2025) for employee ids. Returns None if no emp id found or if the
-    matched token looks like a year in the 2020-2035 range.
+    Extract employee id like 10001 or E10001.
+    Ignore year-like numbers (2020-2035).
     """
     if not text:
         return None
-    m = re.search(r"\b(E?\d{4,6})\b", text, re.IGNORECASE)  # accept E-prefixed ids too
+    m = re.search(r"\b(E?\d{4,6})\b", text, re.IGNORECASE)
     if not m:
         return None
     val = m.group(1)
-
-    # Normalize to core numeric portion if E-prefixed (so we can detect year-like tokens)
     core = val[1:] if val.upper().startswith("E") and val[1:].isdigit() else val
-
-    # Exclude years (2020–2035) so they aren’t mistaken as emp_id
     if core.isdigit() and 2020 <= int(core) <= 2035:
         return None
-
-    # Return the normalized id (strip leading 'E' if present and numeric)
     return core
 
 
 def classify_intent(text: str):
     """
-    Stronger intent classification for apply_leave:
-    - Recognize phrases with 'leave' + verbs (take/apply/book) or 'leave' + number.
-    - Pre-process common typo 'tale' -> 'take'.
+    Lightweight intent classifier for common HR intents.
     """
     if not text:
         return "unknown"
-    # Pre-normalize common mis-typing
     t0 = text.lower()
-    t = re.sub(r"\btale\b", "take", t0)  # catch "tale" -> "take"
-    # quick checks
+    t = re.sub(r"\btale\b", "take", t0)  # typo fix
     if any(k in t for k in ["leave balance", "balance", "remaining leaves", "how many leaves"]):
         return "check_balance"
     if any(k in t for k in ["leave history", "history of leaves", "past leaves"]):
         return "leave_history"
-
-    # detect apply intent: verbs + 'leave' OR 'apply'/'book' present OR numeric pattern near 'leave' or 'day(s)'
     if any(
         k in t
         for k in [
@@ -347,7 +314,6 @@ def classify_intent(text: str):
         ]
     ):
         return "apply_leave"
-    # numeric patterns like "1 leave", "2 days leave", "take 3 days", "one day leave"
     if re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b.*\b(day|days|leave)\b", t):
         return "apply_leave"
     if any(k in t for k in ["apply", "take", "book"]) and "leave" in t:
@@ -358,25 +324,22 @@ def classify_intent(text: str):
 
 
 # ----------------------------
-# Holidays normalization and grouped view
+# Holidays helpers
 # ----------------------------
 def _normalize_holidays_input(raw_holidays):
     if raw_holidays is None:
         return None
-    # JSON string
     if isinstance(raw_holidays, str):
         try:
             parsed = json.loads(raw_holidays)
             return _normalize_holidays_input(parsed)
         except Exception:
             return [{"date": "", "name": raw_holidays}]
-    # dict date->name
     if isinstance(raw_holidays, dict):
         out = []
         for k, v in raw_holidays.items():
             out.append({"date": str(k), "name": str(v)})
         return out
-    # list
     if isinstance(raw_holidays, list):
         out = []
         for item in raw_holidays:
@@ -428,7 +391,6 @@ def show_holidays_grouped(holidays):
                 for r in sorted(rows, key=lambda x: x.get("date") or ""):
                     st.markdown(f"- **{r.get('date','—')}** — {r.get('name','')}")
 
-
 # ----------------------------
 # UI Header
 # ----------------------------
@@ -462,7 +424,7 @@ with colB:
         p1.markdown(f"**Name:** {st.session_state['emp_name'] or '—'}")
         p2.markdown(f"**Project:** {st.session_state['emp_project'] or '—'}")
 
-# Determine whether employee profile is present (used widely)
+# Determine whether employee profile is present
 emp_present = bool(st.session_state.get("emp_id_input"))
 
 st.markdown("---")
@@ -475,11 +437,11 @@ with left_col:
         current_menu = menu_options[0]
     menu_index = menu_options.index(current_menu)
 
-    # Render radio WITHOUT a conflicting key; store selection back to session_state
+    # Render radio and save selection
     menu = st.radio("🧭 Explore", menu_options, index=menu_index)
     st.session_state["menu"] = menu
 
-    # If emp not present: show disabled UIs for each menu choice (user can still view but not submit)
+    # If emp not present: show disabled forms (view-only)
     if not emp_present:
         st.warning(
             "Employee details are required. Please fetch/validate your Employee ID in the 'Who are you?' section to enable actions."
@@ -509,7 +471,7 @@ with left_col:
             st.text_input("Employee ID for history", value=st.session_state.get("emp_id_input", ""), disabled=True)
             st.button("Get Leave History", disabled=True)
         else:
-            # Policies can be viewed even without emp, show as normal
+            # Policies can be viewed without emp
             st.subheader("📘 Company Policies")
             st.markdown(
                 "- **Annual Leave:** 12 days/year  \n- **Sick Leave:** 8 days/year  \n- **Carry Forward:** Up to 5 days"
@@ -525,8 +487,7 @@ with left_col:
             st.info("Policies shown for reference. Validate your Employee ID to access full dashboard features.")
         # allow chat to continue below
     else:
-        # ---------- Normal (emp_present True): full interactive behavior ----------
-        # Leave Balance
+        # emp present: full behavior
         if menu == "Leave Balance":
             st.subheader("📊 Check Leave Balance")
             emp_id = st.text_input("Employee ID", st.session_state.get("emp_id_input", ""), key="lb_emp")
@@ -545,7 +506,6 @@ with left_col:
                     elif res:
                         st.error(res.json().get("detail", "Error fetching balance"))
 
-        # Apply Leave
         if menu == "Apply Leave":
             st.subheader("📝 Apply Leave")
             left, right = st.columns(2)
@@ -591,7 +551,6 @@ with left_col:
                         st.toast(f"⚠️ {msg}", icon="⚠️")
                         st.error(msg)
 
-        # Leave History
         if menu == "Leave History":
             st.subheader("📜 Leave History")
             emp_id_h = st.text_input("Employee ID for history", st.session_state.get("emp_id_input", ""), key="hist_emp")
@@ -617,7 +576,6 @@ with left_col:
                     elif res:
                         st.error(res.json().get("detail", "No history or error"))
 
-        # Policies: load local holidays.json (no upload) if present, else fallback to hardcoded
         if menu == "Policies":
             st.subheader("📘 Company Policies")
             st.markdown("- **Annual Leave:** 12 days/year  \n- **Sick Leave:** 8 days/year  \n- **Carry Forward:** Up to 5 days")
@@ -640,7 +598,7 @@ with left_col:
             holidays = None
             hol_error = None
 
-            # Try user-provided path first
+            # try user path, then UI/holidays.json, then /mnt/data
             candidate_paths = [file_path_input, os.path.join("UI", "holidays.json"), os.path.join("/mnt/data", "UI", "holidays.json")]
             tried = []
             for p in candidate_paths:
@@ -658,18 +616,16 @@ with left_col:
                 except Exception as e:
                     hol_error = (hol_error + " | " if hol_error else "") + f"{p} read error: {e}"
 
-            # If not loaded from file, try hardcoded mapping
+            # fallback to hardcoded mapping
             if holidays is None:
                 holidays = HARDCODED_HOLIDAYS.get((country_code, int(selected_year)), None)
                 if holidays is not None:
                     st.info("Using bundled hardcoded holidays.")
                 else:
-                    # nothing found
                     st.info(f"No local holidays file found (tried: {tried}). No hardcoded entry for {country_code}/{selected_year}.")
                     if hol_error:
                         st.info(f"Details: {hol_error}")
 
-            # Show holidays or example
             if holidays:
                 show_holidays_grouped(holidays)
             else:
@@ -696,12 +652,11 @@ with right_col:
 
     prompt = st.chat_input("Ask Pixie about leaves...")
     if prompt:
-        # keep original for display but preprocess for parsing
         st.session_state["chat_history"].append(("user", prompt))
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # PREPROCESS to fix small typos before classifying/parsing
+        # preprocess common typo
         prompt_clean = re.sub(r"\btale\b", "take", prompt, flags=re.IGNORECASE)
 
         intent = classify_intent(prompt_clean)
@@ -712,7 +667,7 @@ with right_col:
             st.session_state["emp_name"] = emp.get("name") if emp else None
             st.session_state["emp_project"] = emp.get("project") if emp else None
 
-        # ======== INTENT: CHECK BALANCE (NAVIGATE TO LEAVE BALANCE) ========
+        # intent: check balance -> navigate
         if intent == "check_balance":
             emp_id_for_balance = maybe_emp or st.session_state.get("emp_id_input", "").strip()
 
@@ -722,56 +677,40 @@ with right_col:
                 with st.chat_message("assistant"):
                     st.markdown(need_id_msg)
             else:
-                # Prefill the Leave Balance form and navigate there
                 st.session_state["emp_id_input"] = emp_id_for_balance
                 nav_msg = f"Opening **Leave Balance** for Employee ID **{emp_id_for_balance}** — navigating to the Leave Balance tab."
                 st.session_state["chat_history"].append(("assistant", nav_msg))
                 with st.chat_message("assistant"):
                     st.markdown(nav_msg)
-
-                # Navigate to the Leave Balance tab (deferred nav pattern)
                 request_nav("Leave Balance")
 
-        # ======== INTENT: APPLY LEAVE (PREFILL + NAV) ========
+        # intent: apply leave -> prefill and navigate
         elif intent == "apply_leave":
-            # Extract leave type (sick/casual) from prompt (fallback to session default)
             lt = normalize_leave_type(prompt_clean) or st.session_state.get("leave_type_input", "casual")
-
-            # Extract dates from prompt; if only one date, set both to same
             d1, d2 = extract_dates(prompt_clean)
 
-            # If user wrote "1 day" or "one day" assume same-day leave (explicit number phrases)
-            # (this is now handled inside extract_dates when a month token exists)
             if (re.search(r"\b(1|one)\b\s*(day|days)?\b", prompt_clean.lower()) and d1 and not d2):
                 d2 = d1
 
-            # If no dates found, default to today (so form isn't empty)
             if not d1 and not d2:
                 d1 = d2 = date.today()
 
-            # Extract a short reason if present
-            # Capture 'because|as|for|due to|reason' followed by text
             reason_guess = re.search(r"(?:because|as|for|due to|reason)\s+(.+)", prompt_clean, re.IGNORECASE)
             if reason_guess:
                 reason_text = reason_guess.group(1).strip()[:200]
-                # Remove any date-like phrases from the reason (so "for 15 september because of travel" -> "because of travel")
                 reason_text = _strip_date_phrases(reason_text)
             else:
-                # If the message looks like it's just a ISO date token, don't shove that into reason.
                 date_tokens = re.findall(r"\d{4}[/-]\d{2}[/-]\d{2}", prompt_clean)
                 if date_tokens and re.sub(r"[\d\-/\s]", "", prompt_clean).strip() == "":
                     reason_text = ""
                 else:
                     reason_text = st.session_state.get("reason_input", "")
 
-            # IMPORTANT: overwrite session_state date inputs when we parsed dates to avoid stale values
             st.session_state["leave_type_input"] = lt
             st.session_state["from_date_input"] = d1
             st.session_state["to_date_input"] = d2
-            # Clear reason_input if we determined there's no meaningful reason (avoid putting date in reason)
             st.session_state["reason_input"] = reason_text or ""
 
-            # Prepare assistant message summarizing prefill — use freshly parsed values (d1/d2)
             emp_display = st.session_state.get("emp_id_input", "") or "—"
             pref_msg = (
                 "Opening **Apply Leave** with these details prefilled:\n\n"
@@ -784,7 +723,6 @@ with right_col:
                 pref_msg += f"• Reason: *{reason_text}*\n\n"
             pref_msg += "Review and click **Submit Leave Application** to apply."
 
-            # If emp missing, ASK for emp id (do not navigate). Keep prefilled values in session for the form.
             if not st.session_state.get("emp_id_input"):
                 ask_msg = (
                     "I can prefill the leave form for you, but I don't know your Employee ID yet. "
@@ -794,7 +732,6 @@ with right_col:
                 st.session_state["chat_history"].append(("assistant", ask_msg))
                 with st.chat_message("assistant"):
                     st.markdown(ask_msg)
-                # store a small prefill structure so UI can open the form when emp id provided
                 st.session_state["prefill_from_chat"] = {
                     "leave_type": lt,
                     "from_date": d1.isoformat() if d1 else None,
@@ -802,13 +739,12 @@ with right_col:
                     "reason": reason_text or "",
                 }
             else:
-                # emp present -> navigate to Apply Leave tab with prefilled values
                 st.session_state["chat_history"].append(("assistant", pref_msg))
                 with st.chat_message("assistant"):
                     st.markdown(pref_msg)
                 request_nav("Apply Leave")
 
-        # ======== INTENT: POLICIES (OPEN TAB OR RESPOND INLINE) ========
+        # intent: policies -> show inline and open tab
         elif intent == "policies":
             inline = (
                 "Here are key policies:\n"
@@ -837,11 +773,9 @@ with right_col:
                 st.markdown(msg)
 
 
-# If a prefill_from_chat exists and user later fetched profile, automatically open Apply Leave
-# (this is helpful when user first asked Pixie then provided emp id)
+# If a prefill exists and user later provided emp id, open Apply Leave
 if st.session_state.get("prefill_from_chat") and st.session_state.get("emp_id_input"):
     pre = st.session_state.pop("prefill_from_chat")
-    # apply the prefill into session_state fields
     try:
         st.session_state["leave_type_input"] = pre.get("leave_type", st.session_state.get("leave_type_input"))
         if pre.get("from_date"):
@@ -849,13 +783,11 @@ if st.session_state.get("prefill_from_chat") and st.session_state.get("emp_id_in
         if pre.get("to_date"):
             st.session_state["to_date_input"] = date.fromisoformat(pre.get("to_date"))
         st.session_state["reason_input"] = pre.get("reason", st.session_state.get("reason_input"))
-        # Navigate to apply leave so user sees prefilled form
         request_nav("Apply Leave")
     except Exception:
-        # if anything fails just ignore and continue
         pass
 
-# small CSS
+# small CSS tweak
 st.markdown(
     """<style>.stMetric { border-radius: 12px; padding: 8px; }.block-container { padding-top: 1.2rem; }</style>""",
     unsafe_allow_html=True,

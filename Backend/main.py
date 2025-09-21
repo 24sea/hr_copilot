@@ -3,13 +3,10 @@ from datetime import date, datetime
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, Body
 from pydantic import BaseModel, Field
-
 # Use package-qualified import so uvicorn package import works reliably
 from Backend.db import employee_collection, leave_collection
-
 # Needed for atomic find_one_and_update return document constant
 from pymongo import ReturnDocument
-
 # config + logging (non-breaking)
 from .config import settings
 from .logging_config import setup_logging
