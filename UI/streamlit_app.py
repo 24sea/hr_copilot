@@ -451,7 +451,7 @@ with left_col:
             st.text_input("Employee ID", value=st.session_state.get("emp_id_input", ""), disabled=True)
             st.button("Check Balance", disabled=True)
         elif menu == "Apply Leave":
-            st.subheader("📝 Apply Leave (disabled until profile loaded)")
+            st.subheader("📝 Apply Leave (Load profile to enable actions)")
             left, right = st.columns(2)
             with left:
                 st.text_input("Employee ID", value=st.session_state.get("emp_id_input", ""), disabled=True)
@@ -789,6 +789,6 @@ if st.session_state.get("prefill_from_chat") and st.session_state.get("emp_id_in
 
 # small CSS tweak
 st.markdown(
-    """<style>.stMetric { border-radius: 12px; padding: 8px; }.block-container { padding-top: 1.2rem; }</style>""",
+    """<style>.stMetric { border-radius: 12px; padding: 8px; }.block-container { padding-top: 3rem; }</style>""",
     unsafe_allow_html=True,
 )
