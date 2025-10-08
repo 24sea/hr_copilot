@@ -219,6 +219,17 @@ def apply_leave(req: ApplyLeaveRequest):
             req_to = req.to_date
     # ------------------------------------------------------------------------------
 
+    # ---- NEW: prevent duplicate applications for the same emp/type/date range ----
+    existing = leave_collection.find_one({
+        "emp_id": req.emp_id,
+        "leave_type": req.leave_type,
+        "from_date": str(req_from),
+        "to_date": str(req_to)
+    })
+    if existing:
+        raise HTTPException(status_code=400, detail="Leave already applied for these dates.")
+    # ------------------------------------------------------------------------------
+
     days_requested = (req_to - req_from).days + 1
     if days_requested <= 0:
         raise HTTPException(status_code=400, detail="Invalid leave duration")

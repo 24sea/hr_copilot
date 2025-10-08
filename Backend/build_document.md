@@ -75,3 +75,8 @@ bash:
 streamlit run UI/streamlit_app.py --server.port 8501
 
 # Open in browser:- http://localhost:8501 🚀
+
+
+## Demo Video
+follow the onedrive link for `demo_recording_.mp4` for a quick walkthrough of the app. [PATH : C:\CodeBase\hr_copilot\Hr_copilot_recording.mp4]
+
